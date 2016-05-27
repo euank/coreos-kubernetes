@@ -5,10 +5,10 @@ set -e
 export ETCD_ENDPOINTS="http://127.0.0.1:2379"
 
 # Specify the version (vX.Y.Z) of Kubernetes assets to deploy
-export K8S_VER=v1.2.4_coreos.cni.1
+export K8S_VER=v1.3.0-alpha.5.rktnetes
 
 # Hyperkube image repository to use.
-export HYPERKUBE_IMAGE_REPO=quay.io/coreos/hyperkube
+export HYPERKUBE_IMAGE_REPO=quay.io/peanutbutter/hyperkube
 
 # The CIDR network to use for pod IPs.
 # Each pod launched in the cluster will be assigned an IP out of this range.
@@ -32,7 +32,7 @@ export DNS_SERVICE_IP=10.3.0.10
 
 # Whether to use Calico for Kubernetes network policy. When using Calico,
 # K8S_VER (above) must be changed to an image tagged with CNI (e.g. v1.2.4_coreos.cni.1).
-export USE_CALICO=true
+export USE_CALICO=false
 
 # -------------
 
@@ -57,29 +57,6 @@ function init_config {
     fi
 }
 
-function init_flannel {
-    echo "Waiting for etcd..."
-    while true
-    do
-        IFS=',' read -ra ES <<< "$ETCD_ENDPOINTS"
-        for ETCD in "${ES[@]}"; do
-            echo "Trying: $ETCD"
-            if [ -n "$(curl --silent "$ETCD/v2/machines")" ]; then
-                local ACTIVE_ETCD=$ETCD
-                break
-            fi
-            sleep 1
-        done
-        if [ -n "$ACTIVE_ETCD" ]; then
-            break
-        fi
-    done
-    RES=$(curl --silent -X PUT -d "value={\"Network\":\"$POD_NETWORK\",\"Backend\":{\"Type\":\"vxlan\"}}" "$ACTIVE_ETCD/v2/keys/coreos.com/network/config?prevExist=false")
-    if [ -z "$(echo $RES | grep '"action":"create"')" ] && [ -z "$(echo $RES | grep 'Key already exists')" ]; then
-        echo "Unexpected error configuring flannel pod network: $RES"
-    fi
-}
-
 function init_templates {
     local TEMPLATE=/etc/systemd/system/kubelet.service
     [ -f $TEMPLATE ] || {
@@ -88,20 +65,64 @@ function init_templates {
         cat << EOF > $TEMPLATE
 [Service]
 ExecStartPre=/usr/bin/mkdir -p /etc/kubernetes/manifests
+ExecStartPre=/usr/bin/touch /etc/hosts
 
 Environment=KUBELET_VERSION=${K8S_VER}
 Environment=KUBELET_ACI=${HYPERKUBE_IMAGE_REPO}
+Environment="RKT_OPTS=--volume dns,kind=host,source=/etc/resolv.conf --mount volume=dns,target=/etc/resolv.conf --volume rktbin,kind=host,source=/usr/bin/rkt --mount volume=rktbin,target=/usr/bin/rkt --volume var-lib-rkt,kind=host,source=/var/lib/rkt --mount volume=var-lib-rkt,target=/var/lib/rkt --volume=stage,kind=host,source=/usr/lib/rkt --mount volume=stage,target=/usr/lib/rkt --volume=cni,kind=host,source=/opt/cni --mount volume=cni,target=/opt/cni --volume=mp,kind=host,source=/usr/sbin/modprobe --mount volume=mp,target=/usr/bin/modprobe --volume journalctl,kind=host,source=/usr/bin/journalctl --mount volume=journalctl,target=/usr/bin/journalctl"
 ExecStartPre=/usr/bin/mkdir -p /etc/kubernetes/manifests
 ExecStart=/usr/lib/coreos/kubelet-wrapper \
   --api-servers=http://127.0.0.1:8080 \
   --network-plugin-dir=/etc/kubernetes/cni/net.d \
-  --network-plugin=${K8S_NETWORK_PLUGIN} \
+  --network-plugin=kubenet \
+  --reconcile-cidr=true \
+  --pod-cidr=${POD_NETWORK} \
+  --configure-cbr0=false \
+  --enable-debugging-handlers=true \
+  --cluster_domain=cluster.local \
+  --v=10 \
+  --container-runtime=rkt \
+  --rkt-path=/usr/bin/rkt \
+  --rkt-stage1-image=/usr/lib/rkt/stage1-images/stage1-coreos.aci \
   --register-node=true \
   --allow-privileged=true \
   --config=/etc/kubernetes/manifests \
   --hostname-override=${ADVERTISE_IP} \
-  --cluster_dns=${DNS_SERVICE_IP} \
-  --cluster_domain=cluster.local
+  --cluster_dns=${DNS_SERVICE_IP} 
+Restart=always
+RestartSec=10
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/install-cni.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Download cni
+Requires=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/mkdir -p /opt/cni
+ExecStartPre=/usr/bin/curl --fail --silent --show-error --location --create-dirs --output /opt/downloads/cni.tar.gz https://storage.googleapis.com/kubernetes-release/network-plugins/cni-42c4cb842dad606a84e93aad5a4484ded48e3046.tar.gz
+ExecStart=/usr/bin/tar xf /opt/downloads/cni.tar.gz -C /opt/cni/
+EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/rkt-api.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Service]
+ExecStart=/usr/bin/rkt api-service
 Restart=always
 RestartSec=10
 
@@ -162,16 +183,35 @@ spec:
     - proxy
     - --master=http://127.0.0.1:8080
     - --proxy-mode=iptables
+    - --v=2
     securityContext:
       privileged: true
     volumeMounts:
     - mountPath: /etc/ssl/certs
       name: ssl-certs-host
       readOnly: true
+    - mountPath: /sys/module/nf_conntrack/parameters
+      name: sys-hashsize
+      readOnly: false 
+    - mountPath: /var/run/dbus
+      name: dbus
+      readOnly: false
+    - mountPath: /proc/sys/net
+      name: proc-sys-net
+      readOnly: false 
   volumes:
   - hostPath:
       path: /usr/share/ca-certificates
     name: ssl-certs-host
+  - hostPath:
+      path: /sys/module/nf_conntrack/parameters
+    name: sys-hashsize
+  - hostPath:
+      path: /var/run/dbus
+    name: dbus
+  - hostPath:
+      path: /proc/sys/net
+    name: proc-sys-net
 EOF
     }
 
@@ -249,6 +289,9 @@ spec:
     - --master=http://127.0.0.1:8080
     - --service-account-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem
     - --root-ca-file=/etc/kubernetes/ssl/ca.pem
+    - --cluster-cidr=${POD_NETWORK}
+    - --allocate-node-cidrs=true
+    - --v=2
     livenessProbe:
       httpGet:
         host: 127.0.0.1
@@ -735,37 +778,6 @@ EOF
 EOF
     }
 
-    local TEMPLATE=/etc/flannel/options.env
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-FLANNELD_IFACE=$ADVERTISE_IP
-FLANNELD_ETCD_ENDPOINTS=$ETCD_ENDPOINTS
-EOF
-    }
-
-    local TEMPLATE=/etc/systemd/system/flanneld.service.d/40-ExecStartPre-symlink.conf.conf
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-[Service]
-ExecStartPre=/usr/bin/ln -sf /etc/flannel/options.env /run/flannel/options.env
-EOF
-    }
-
-    local TEMPLATE=/etc/systemd/system/docker.service.d/40-flannel.conf
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-[Unit]
-Requires=flanneld.service
-After=flanneld.service
-EOF
-    }
-
     local TEMPLATE=/etc/kubernetes/cni/net.d/10-calico.conf
     [ -f $TEMPLATE ] || {
         echo "TEMPLATE: $TEMPLATE"
@@ -825,13 +837,13 @@ init_config
 init_templates
 systemctl enable etcd2; systemctl start etcd2
 
-init_flannel
-
 systemctl stop update-engine; systemctl mask update-engine
 
 systemctl daemon-reload
-systemctl enable flanneld; systemctl start flanneld
+systemctl start install-cni
 systemctl enable kubelet; systemctl start kubelet
+sleep 5
+systemctl enable rkt-api; systemctl start rkt-api
 
 if [ $USE_CALICO = "true" ]; then
         systemctl enable calico-node; systemctl start calico-node
