@@ -116,6 +116,24 @@ ExecStart=/usr/bin/tar xf /opt/downloads/cni.tar.gz -C /opt/cni/
 EOF
     }
 
+    local TEMPLATE=/etc/systemd/system/install-kproxy.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Download kube-proxy
+Requires=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/mkdir -p /opt/
+ExecStartPre=/usr/bin/curl --fail --silent --show-error --location --create-dirs --output /opt/kube-proxy https://storage.googleapis.com/kubernetes-release/release/v1.3.0-alpha.5/bin/linux/amd64/kube-proxy
+ExecStart=/usr/bin/chmod +x /opt/kube-proxy
+EOF
+    }
+
     local TEMPLATE=/etc/systemd/system/rkt-api.service
     [ -f $TEMPLATE ] || {
         echo "TEMPLATE: $TEMPLATE"
@@ -129,6 +147,28 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/kproxy.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Start Kube-proxy service as Daemon
+[Service]
+ExecStart=/opt/kube-proxy \
+--master=http://127.0.0.1:8080 \
+--proxy-mode=iptables \
+--v=2 \
+--logtostderr=true
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     }
 
     local TEMPLATE=/etc/systemd/system/calico-node.service
@@ -162,59 +202,6 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 EOF
     }
-
-    local TEMPLATE=/etc/kubernetes/manifests/kube-proxy.yaml
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-apiVersion: v1
-kind: Pod
-metadata:
-  name: kube-proxy
-  namespace: kube-system
-spec:
-  hostNetwork: true
-  containers:
-  - name: kube-proxy
-    image: ${HYPERKUBE_IMAGE_REPO}:$K8S_VER
-    command:
-    - /hyperkube
-    - proxy
-    - --master=http://127.0.0.1:8080
-    - --proxy-mode=iptables
-    - --v=2
-    securityContext:
-      privileged: true
-    volumeMounts:
-    - mountPath: /etc/ssl/certs
-      name: ssl-certs-host
-      readOnly: true
-    - mountPath: /sys/module/nf_conntrack/parameters
-      name: sys-hashsize
-      readOnly: false 
-    - mountPath: /var/run/dbus
-      name: dbus
-      readOnly: false
-    - mountPath: /proc/sys/net
-      name: proc-sys-net
-      readOnly: false 
-  volumes:
-  - hostPath:
-      path: /usr/share/ca-certificates
-    name: ssl-certs-host
-  - hostPath:
-      path: /sys/module/nf_conntrack/parameters
-    name: sys-hashsize
-  - hostPath:
-      path: /var/run/dbus
-    name: dbus
-  - hostPath:
-      path: /proc/sys/net
-    name: proc-sys-net
-EOF
-    }
-
     local TEMPLATE=/etc/kubernetes/manifests/kube-apiserver.yaml
     [ -f $TEMPLATE ] || {
         echo "TEMPLATE: $TEMPLATE"
@@ -838,12 +825,16 @@ init_templates
 systemctl enable etcd2; systemctl start etcd2
 
 systemctl stop update-engine; systemctl mask update-engine
+systemctl stop docker; systemctl mask docker
 
 systemctl daemon-reload
 systemctl start install-cni
+systemctl start install-kproxy
+sleep 10
 systemctl enable kubelet; systemctl start kubelet
 sleep 5
 systemctl enable rkt-api; systemctl start rkt-api
+systemctl enable kproxy; systemctl start kproxy 
 
 if [ $USE_CALICO = "true" ]; then
         systemctl enable calico-node; systemctl start calico-node
