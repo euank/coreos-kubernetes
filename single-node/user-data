@@ -5,7 +5,7 @@ set -e
 export ETCD_ENDPOINTS="http://127.0.0.1:2379"
 
 # Specify the version (vX.Y.Z) of Kubernetes assets to deploy
-export K8S_VER=v1.3.0-alpha.5.rktnetes
+export K8S_VER=v1.3.0-beta.coreos.2
 
 # Hyperkube image repository to use.
 export HYPERKUBE_IMAGE_REPO=quay.io/peanutbutter/hyperkube
@@ -69,9 +69,9 @@ ExecStartPre=/usr/bin/touch /etc/hosts
 
 Environment=KUBELET_VERSION=${K8S_VER}
 Environment=KUBELET_ACI=${HYPERKUBE_IMAGE_REPO}
-Environment="RKT_OPTS=--volume dns,kind=host,source=/etc/resolv.conf --mount volume=dns,target=/etc/resolv.conf --volume rktbin,kind=host,source=/usr/bin/rkt --mount volume=rktbin,target=/usr/bin/rkt --volume var-lib-rkt,kind=host,source=/var/lib/rkt --mount volume=var-lib-rkt,target=/var/lib/rkt --volume=stage,kind=host,source=/usr/lib/rkt --mount volume=stage,target=/usr/lib/rkt --volume=cni,kind=host,source=/opt/cni --mount volume=cni,target=/opt/cni --volume=mp,kind=host,source=/usr/sbin/modprobe --mount volume=mp,target=/usr/bin/modprobe --volume journalctl,kind=host,source=/usr/bin/journalctl --mount volume=journalctl,target=/usr/bin/journalctl"
+Environment="RKT_OPTS=--volume dns,kind=host,source=/etc/resolv.conf --mount volume=dns,target=/etc/resolv.conf --volume rktbin,kind=host,source=/share/bin/rkt --mount volume=rktbin,target=/share/bin/rkt --volume var-lib-rkt,kind=host,source=/var/lib/rkt --mount volume=var-lib-rkt,target=/var/lib/rkt --volume=stage,kind=host,source=/usr/lib/rkt --mount volume=stage,target=/usr/lib/rkt --volume=cni,kind=host,source=/opt/cni --mount volume=cni,target=/opt/cni --volume=mp,kind=host,source=/usr/sbin/modprobe --mount volume=mp,target=/usr/bin/modprobe --volume journalctl,kind=host,source=/usr/bin/journalctl --mount volume=journalctl,target=/usr/bin/journalctl --volume share,kind=host,source=/share --mount volume=share,target=/share"
 ExecStartPre=/usr/bin/mkdir -p /etc/kubernetes/manifests
-ExecStart=/usr/lib/coreos/kubelet-wrapper \
+ExecStart=/share/bin/kubelet-wrapper \
   --api-servers=http://127.0.0.1:8080 \
   --network-plugin-dir=/etc/kubernetes/cni/net.d \
   --network-plugin=kubenet \
@@ -82,8 +82,8 @@ ExecStart=/usr/lib/coreos/kubelet-wrapper \
   --cluster_domain=cluster.local \
   --v=10 \
   --container-runtime=rkt \
-  --rkt-path=/usr/bin/rkt \
-  --rkt-stage1-image=/usr/lib/rkt/stage1-images/stage1-coreos.aci \
+  --rkt-path=/share/bin/rkt \
+  --rkt-stage1-image=/share/bin/stage1-coreos.aci \
   --register-node=true \
   --allow-privileged=true \
   --config=/etc/kubernetes/manifests \
@@ -140,7 +140,7 @@ EOF
         mkdir -p $(dirname $TEMPLATE)
         cat << EOF > $TEMPLATE
 [Service]
-ExecStart=/usr/bin/rkt api-service
+ExecStart=/share/bin/rkt api-service
 Restart=always
 RestartSec=10
 
@@ -190,7 +190,7 @@ Environment=FELIX_FELIXHOSTNAME=${ADVERTISE_IP}
 Environment=CALICO_NETWORKING=false
 Environment=NO_DEFAULT_POOLS=true
 Environment=ETCD_ENDPOINTS=${ETCD_ENDPOINTS}
-ExecStart=/usr/bin/rkt run --inherit-env --stage1-from-dir=stage1-fly.aci \
+ExecStart=/share/bin/rkt run --inherit-env --stage1-path=/share/bin/stage1-fly.aci \
 --volume=modules,kind=host,source=/lib/modules,readOnly=false \
 --mount=volume=modules,target=/lib/modules \
 --trust-keys-from-https quay.io/calico/node:v0.19.0
@@ -827,6 +827,7 @@ systemctl enable etcd2; systemctl start etcd2
 systemctl stop update-engine; systemctl mask update-engine
 systemctl stop docker; systemctl mask docker
 
+sudo /share/bin/rkt fetch --insecure-options=image /share/*.aci
 systemctl daemon-reload
 systemctl start install-cni
 systemctl start install-kproxy
